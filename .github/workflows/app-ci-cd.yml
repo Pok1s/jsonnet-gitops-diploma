@@ -1,0 +1,154 @@
+name: Demo App CI/CD
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - demo-app-repo/**
+      - .github/workflows/app-ci-cd.yml
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment to update
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  APP_DIR: demo-app-repo
+  GITOPS_DIR: gitops-repo
+  IMAGE_NAME: diploma-demo-web
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: demo-app-repo/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Static syntax check
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    environment: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'stage' || 'dev') }}
+    outputs:
+      image_repository: ${{ steps.meta.outputs.image_repository }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      environment: ${{ steps.target.outputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [[ -n "${{ github.event.inputs.environment }}" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            ENVIRONMENT="stage"
+          else
+            ENVIRONMENT="dev"
+          fi
+          echo "environment=${ENVIRONMENT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare image metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${{ steps.target.outputs.environment }}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}"
+          IMAGE_REPOSITORY="${{ vars.ACR_LOGIN_SERVER }}/${IMAGE_NAME}"
+          echo "image_tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_repository=${IMAGE_REPOSITORY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: demo-app-repo
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_repository }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.image_repository }}:${{ steps.target.outputs.environment }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Jsonnet tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jsonnet
+
+      - name: Update GitOps image tag
+        run: |
+          chmod +x "${APP_DIR}/scripts/update-gitops-image.sh"
+          "${APP_DIR}/scripts/update-gitops-image.sh" \
+            "${GITOPS_DIR}" \
+            "${{ steps.target.outputs.environment }}" \
+            "${{ steps.meta.outputs.image_repository }}" \
+            "${{ steps.meta.outputs.image_tag }}" \
+            "${GITHUB_SHA}"
+
+      - name: Validate app-generator Jsonnet output
+        working-directory: ${{ env.GITOPS_DIR }}
+        run: |
+          jsonnet \
+            --ext-str envs_file="${{ steps.target.outputs.environment }}" \
+            --ext-str env="" \
+            --ext-str repo_url="${{ vars.GH_GITOPS_REPO_URL }}" \
+            app-generator/app-generator-list.jsonnet >/tmp/generated-apps.json
+
+      - name: Commit GitOps change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${GITOPS_DIR}/values/diploma-demo/demo-web/values-${{ steps.target.outputs.environment }}.yaml"
+          if git diff --cached --quiet; then
+            echo "No GitOps changes to commit"
+            exit 0
+          fi
+          git commit -m "Deploy diploma-demo-web ${{ steps.meta.outputs.image_tag }} to ${{ steps.target.outputs.environment }}"
+          git push

@@ -1,0 +1,88 @@
+nameOverride: ""
+replicaCount: 1
+
+image:
+  repository: pok1sdiplomaacr.azurecr.io/diploma-demo-web
+  tag: dev-initial
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+controller:
+  labels: {}
+  strategy: RollingUpdate
+  rollingUpdate:
+    surge: 1
+    unavailable: 0
+
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  main:
+    enabled: true
+    ports:
+      http:
+        enabled: true
+        port: 80
+        targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: dev.diploma-demo.local
+  hostlessRule: false
+  extraHosts: []
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+
+config:
+  APP_NAME: diploma-demo-web
+  APP_ENV: dev
+  APP_VERSION: dev-initial
+  DEPLOYMENT_TIMESTAMP: "2026-05-06T20:00:00Z"
+  GIT_SHA: initial
+  PORT: "8080"
+
+secret:
+  enabled: true
+  data:
+    EXAMPLE_API_TOKEN: demo-token-dev
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    cpu: 300m
+    memory: 256Mi
+
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 20
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  cpuAverageUtilization: 70

@@ -1,0 +1,352 @@
+name: Full Bootstrap And Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - demo-app-repo/**
+      - gitops-repo/app-generator/**
+      - gitops-repo/applicationsets/**
+      - gitops-repo/charts/**
+      - terraform/azure/**
+      - .github/workflows/full-bootstrap-deploy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: full-bootstrap-deploy
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_WORKING_DIR: terraform/azure
+  APP_DIR: demo-app-repo
+  GITOPS_DIR: gitops-repo
+  IMAGE_NAME: diploma-demo-web
+
+jobs:
+  bootstrap-deploy:
+    name: Bootstrap Azure, Argo CD, Build Images, Update GitOps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse bootstrap credentials
+        env:
+          BOOTSTRAP_CREDENTIALS: ${{ secrets.BOOTSTRAP_CREDENTIALS }}
+        run: |
+          CLIENT_ID="$(jq -r '.azure_client_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          CLIENT_SECRET="$(jq -r '.azure_client_secret' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          TENANT_ID="$(jq -r '.azure_tenant_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          SUBSCRIPTION_ID="$(jq -r '.azure_subscription_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          GITHUB_ADMIN_TOKEN="$(jq -r '.github_token' <<< "${BOOTSTRAP_CREDENTIALS}")"
+
+          for value in "${CLIENT_ID}" "${CLIENT_SECRET}" "${TENANT_ID}" "${SUBSCRIPTION_ID}" "${GITHUB_ADMIN_TOKEN}"; do
+            echo "::add-mask::${value}"
+          done
+
+          {
+            echo "BOOTSTRAP_AZURE_CLIENT_ID=${CLIENT_ID}"
+            echo "BOOTSTRAP_AZURE_CLIENT_SECRET=${CLIENT_SECRET}"
+            echo "BOOTSTRAP_AZURE_TENANT_ID=${TENANT_ID}"
+            echo "BOOTSTRAP_AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}"
+            echo "BOOTSTRAP_GITHUB_TOKEN=${GITHUB_ADMIN_TOKEN}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Azure login
+        run: |
+          az login --service-principal \
+            --username "${BOOTSTRAP_AZURE_CLIENT_ID}" \
+            --password "${BOOTSTRAP_AZURE_CLIENT_SECRET}" \
+            --tenant "${BOOTSTRAP_AZURE_TENANT_ID}"
+          az account set --subscription "${BOOTSTRAP_AZURE_SUBSCRIPTION_ID}"
+
+      - name: Create Terraform state backend
+        run: |
+          az provider register --namespace Microsoft.Storage
+          az provider register --namespace Microsoft.ContainerService
+          az provider register --namespace Microsoft.ContainerRegistry
+          az provider register --namespace Microsoft.Network
+          az provider register --namespace Microsoft.ManagedIdentity
+
+          az group create \
+            --name "${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            --location "${{ vars.TF_STATE_LOCATION }}"
+
+          az storage account create \
+            --name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --resource-group "${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            --location "${{ vars.TF_STATE_LOCATION }}" \
+            --sku Standard_LRS \
+            --kind StorageV2 \
+            --min-tls-version TLS1_2 \
+            --allow-blob-public-access false
+
+          STORAGE_KEY="$(az storage account keys list \
+            --resource-group "${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            --account-name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --query '[0].value' \
+            --output tsv)"
+
+          az storage container create \
+            --name "${{ vars.TF_STATE_CONTAINER }}" \
+            --account-name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --account-key "${STORAGE_KEY}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve
+        env:
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_subscription_id: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ env.BOOTSTRAP_GITHUB_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ github.repository_owner }}
+          TF_VAR_github_app_repo: ${{ github.event.repository.name }}
+          TF_VAR_github_gitops_repo: ${{ github.event.repository.name }}
+          TF_VAR_github_gitops_repo_url: https://github.com/${{ github.repository }}.git
+
+      - name: Push generated GitHub secrets and variables
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          GH_TOKEN: ${{ env.BOOTSTRAP_GITHUB_TOKEN }}
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+        run: |
+          GENERATED_CLIENT_ID="$(terraform output -raw github_actions_client_id)"
+          GENERATED_TENANT_ID="$(terraform output -raw github_actions_tenant_id)"
+          GENERATED_SUBSCRIPTION_ID="$(terraform output -raw github_actions_subscription_id)"
+          terraform output -json github_actions_repository_variables > /tmp/generated-vars.json
+          GENERATED_ACR_NAME="$(jq -r '.ACR_NAME' /tmp/generated-vars.json)"
+          GENERATED_ACR_LOGIN_SERVER="$(terraform output -raw acr_login_server)"
+
+          gh secret set AZURE_CLIENT_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_CLIENT_ID}"
+          gh secret set AZURE_TENANT_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_TENANT_ID}"
+          gh secret set AZURE_SUBSCRIPTION_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_SUBSCRIPTION_ID}"
+          gh secret set GITOPS_REPOSITORY_TOKEN --repo "${GITHUB_REPOSITORY}" --body "${BOOTSTRAP_GITHUB_TOKEN}"
+
+          for name in ACR_NAME ACR_LOGIN_SERVER GITOPS_REPOSITORY GH_OWNER GH_APP_REPO GH_GITOPS_REPO GH_GITOPS_REPO_URL; do
+            value="$(jq -r --arg name "${name}" '.[$name]' /tmp/generated-vars.json)"
+            gh variable set "${name}" --repo "${GITHUB_REPOSITORY}" --body "${value}"
+          done
+
+          {
+            echo "GENERATED_ACR_NAME=${GENERATED_ACR_NAME}"
+            echo "GENERATED_ACR_LOGIN_SERVER=${GENERATED_ACR_LOGIN_SERVER}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Configure Argo CD access and public URLs
+        env:
+          ARGOCD_ADMIN_PASSWORD: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+        run: |
+          echo "::add-mask::${ARGOCD_ADMIN_PASSWORD}"
+
+          az aks get-credentials \
+            --resource-group rg-diploma-gitops-demo \
+            --name aks-diploma-gitops-demo \
+            --admin \
+            --overwrite-existing
+
+          for attempt in {1..60}; do
+            INGRESS_IP="$(kubectl get service ingress-nginx-controller \
+              --namespace ingress-nginx \
+              --output jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+            if [ -n "${INGRESS_IP}" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ -z "${INGRESS_IP}" ]; then
+            echo "Ingress public IP was not assigned in time" >&2
+            exit 1
+          fi
+
+          ARGOCD_PUBLIC_HOST="argocd.${INGRESS_IP}.sslip.io"
+          kubectl -n argocd patch ingress argo-cd-argocd-server --type merge \
+            -p "$(jq -n --arg public_host "${ARGOCD_PUBLIC_HOST}" '{
+              spec: {
+                rules: [
+                  {
+                    host: "argocd.diploma-demo.local",
+                    http: {
+                      paths: [{
+                        path: "/",
+                        pathType: "Prefix",
+                        backend: {service: {name: "argo-cd-argocd-server", port: {number: 80}}}
+                      }]
+                    }
+                  },
+                  {
+                    host: $public_host,
+                    http: {
+                      paths: [{
+                        path: "/",
+                        pathType: "Prefix",
+                        backend: {service: {name: "argo-cd-argocd-server", port: {number: 80}}}
+                      }]
+                    }
+                  }
+                ]
+              }
+            }')"
+
+          sudo apt-get update
+          sudo apt-get install -y apache2-utils
+
+          ADMIN_PASSWORD_HASH="$(htpasswd -bnBC 10 "" "${ARGOCD_ADMIN_PASSWORD}" | tr -d ':\n' | sed 's/$2y/$2a/')"
+          kubectl -n argocd patch secret argocd-secret --type merge \
+            -p "$(jq -n \
+              --arg hash "${ADMIN_PASSWORD_HASH}" \
+              --arg mtime "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              '{stringData: {"admin.password": $hash, "admin.passwordMtime": $mtime}}')"
+          kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found
+
+          {
+            echo "INGRESS_IP=${INGRESS_IP}"
+            echo "ARGOCD_URL=http://${ARGOCD_PUBLIC_HOST}"
+            echo "DEV_URL=http://dev.${INGRESS_IP}.sslip.io"
+            echo "STAGE_URL=http://stage.${INGRESS_IP}.sslip.io"
+            echo "PROD_URL=http://${INGRESS_IP}"
+            echo "PROD_SSLIP_URL=http://prod.${INGRESS_IP}.sslip.io"
+          } >> "${GITHUB_ENV}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: demo-app-repo/package-lock.json
+
+      - name: Test demo app
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npm ci
+          npm run lint
+          npm test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${GENERATED_ACR_NAME}"
+
+      - name: Install Jsonnet tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jsonnet
+
+      - name: Build images and update GitOps values
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_REPOSITORY="${GENERATED_ACR_LOGIN_SERVER}/${IMAGE_NAME}"
+
+          for environment in dev stage prod; do
+            IMAGE_TAG="${environment}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}"
+            docker buildx build \
+              --push \
+              --tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+              --tag "${IMAGE_REPOSITORY}:${environment}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              "${APP_DIR}"
+
+            chmod +x "${APP_DIR}/scripts/update-gitops-image.sh"
+            "${APP_DIR}/scripts/update-gitops-image.sh" \
+              "${GITOPS_DIR}" \
+              "${environment}" \
+              "${IMAGE_REPOSITORY}" \
+              "${IMAGE_TAG}" \
+              "${GITHUB_SHA}"
+
+            case "${environment}" in
+              dev) public_host="dev.${INGRESS_IP}.sslip.io" ;;
+              stage) public_host="stage.${INGRESS_IP}.sslip.io" ;;
+              prod) public_host="prod.${INGRESS_IP}.sslip.io" ;;
+            esac
+
+            ruby -ryaml -e '
+              file, host = ARGV
+              values = YAML.load_file(file)
+              values["ingress"] ||= {}
+              values["ingress"]["extraHosts"] = [host]
+              File.write(file, YAML.dump(values).sub(/\A---\n/, ""))
+            ' "${GITOPS_DIR}/values/diploma-demo/demo-web/values-${environment}.yaml" "${public_host}"
+
+            jsonnet \
+              --jpath "${GITOPS_DIR}/app-generator" \
+              --ext-str envs_file="${environment}" \
+              --ext-str env="" \
+              --ext-str repo_url="https://github.com/${GITHUB_REPOSITORY}.git" \
+              "${GITOPS_DIR}/app-generator/app-generator-list.jsonnet" >/tmp/generated-${environment}.json
+          done
+
+      - name: Commit GitOps deployment changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${GITOPS_DIR}/values/diploma-demo/demo-web"
+          if git diff --cached --quiet; then
+            echo "No GitOps changes to commit"
+            exit 0
+          fi
+          git commit -m "Deploy diploma-demo-web ${GITHUB_SHA::7} to dev stage prod"
+          git push "https://x-access-token:${BOOTSTRAP_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+
+      - name: Publish deployment summary
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+          ## Diploma GitOps CI/CD deployment
+
+          ### Argo CD
+
+          - URL: ${ARGOCD_URL}
+          - Username: \`admin\`
+          - Password: configured from \`ARGOCD_ADMIN_PASSWORD\` repository secret
+
+          ### Demo environments
+
+          - Dev: ${DEV_URL}
+          - Stage: ${STAGE_URL}
+          - Prod: ${PROD_URL}
+          - Prod DNS URL: ${PROD_SSLIP_URL}
+
+          ### Azure
+
+          - AKS: \`aks-diploma-gitops-demo\`
+          - ACR: \`${GENERATED_ACR_LOGIN_SERVER}\`
+          - Ingress public IP: \`${INGRESS_IP}\`
+          EOF

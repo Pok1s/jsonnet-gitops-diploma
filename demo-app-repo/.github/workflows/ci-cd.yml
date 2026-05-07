@@ -1,0 +1,130 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - release/*
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment to update
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: diploma-demo-web
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Static syntax check
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/reusable-build-push.yml
+    with:
+      image_name: diploma-demo-web
+      registry: ${{ vars.ACR_LOGIN_SERVER }}
+      push: true
+      tag_prefix: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'stage' || 'dev') }}
+    secrets: inherit
+
+  update-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    environment: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'stage' || 'dev') }}
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+          path: gitops
+          ref: main
+
+      - name: Install Jsonnet tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jsonnet
+
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [[ -n "${{ github.event.inputs.environment }}" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            ENVIRONMENT="stage"
+          else
+            ENVIRONMENT="dev"
+          fi
+          echo "environment=${ENVIRONMENT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update GitOps image tag
+        run: |
+          chmod +x app/scripts/update-gitops-image.sh
+          app/scripts/update-gitops-image.sh \
+            gitops \
+            "${{ steps.target.outputs.environment }}" \
+            "${{ needs.build.outputs.image_repository }}" \
+            "${{ needs.build.outputs.image_tag }}" \
+            "${GITHUB_SHA}"
+
+      - name: Validate app-generator Jsonnet output
+        working-directory: gitops
+        run: |
+          jsonnet \
+            --ext-str envs_file="${{ steps.target.outputs.environment }}" \
+            --ext-str env="" \
+            app-generator/app-generator-list.jsonnet >/tmp/generated-apps.json
+
+      - name: Commit GitOps change
+        working-directory: gitops
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add values/diploma-demo/demo-web/values-${{ steps.target.outputs.environment }}.yaml
+          if git diff --cached --quiet; then
+            echo "No GitOps changes to commit"
+            exit 0
+          fi
+          git commit -m "Deploy diploma-demo-web ${{ needs.build.outputs.image_tag }} to ${{ steps.target.outputs.environment }}"
+          git push

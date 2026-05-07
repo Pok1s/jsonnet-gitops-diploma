@@ -1,0 +1,41 @@
+nameOverride: demo-web
+replicaCount: 2
+controller:
+  labels:
+    environment: stage
+    stack: demo
+    component: demo-web
+podLabels:
+  environment: stage
+  stack: demo
+  component: demo-web
+image:
+  repository: pok1sdiplomaacrauto.azurecr.io/diploma-demo-web
+  tag: stage-0e7c501-1
+config:
+  APP_NAME: diploma-demo-web
+  APP_ENV: stage
+  APP_VERSION: stage-0e7c501-1
+  DEPLOYMENT_TIMESTAMP: '2026-05-07T00:06:02Z'
+  GIT_SHA: 0e7c5010d2814edc819c41e4baf11ae6cae85470
+  PORT: '8080'
+secret:
+  enabled: true
+  data:
+    EXAMPLE_API_TOKEN: demo-token-stage
+ingress:
+  enabled: true
+  className: nginx
+  host: stage.diploma-demo.local
+resources:
+  requests:
+    cpu: 75m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 384Mi
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  cpuAverageUtilization: 65

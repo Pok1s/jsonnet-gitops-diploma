@@ -1,0 +1,432 @@
+name: Terraform Azure Infrastructure
+
+on:
+  pull_request:
+    paths:
+      - terraform/azure/**
+      - gitops-repo/applicationsets/**
+      - .github/workflows/terraform-azure.yml
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action
+        required: true
+        default: plan
+        type: choice
+        options:
+          - bootstrap-backend
+          - bootstrap-apply
+          - plan
+          - apply
+          - destroy-plan
+          - destroy
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_WORKING_DIR: terraform/azure
+
+jobs:
+  bootstrap-backend:
+    name: Bootstrap Backend
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'bootstrap-backend'
+    environment: azure-apply
+    steps:
+      - name: Azure login
+        env:
+          BOOTSTRAP_CREDENTIALS: ${{ secrets.BOOTSTRAP_CREDENTIALS }}
+        run: |
+          CLIENT_ID="$(jq -r '.azure_client_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          CLIENT_SECRET="$(jq -r '.azure_client_secret' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          TENANT_ID="$(jq -r '.azure_tenant_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          SUBSCRIPTION_ID="$(jq -r '.azure_subscription_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          az login --service-principal \
+            --username "${CLIENT_ID}" \
+            --password "${CLIENT_SECRET}" \
+            --tenant "${TENANT_ID}"
+          az account set --subscription "${SUBSCRIPTION_ID}"
+
+      - name: Create Terraform state backend
+        run: |
+          az provider register --namespace Microsoft.Storage
+          az provider register --namespace Microsoft.ContainerService
+          az provider register --namespace Microsoft.ContainerRegistry
+          az provider register --namespace Microsoft.Network
+          az provider register --namespace Microsoft.ManagedIdentity
+
+          az provider show --namespace Microsoft.Storage --query registrationState -o tsv
+          az provider show --namespace Microsoft.ContainerService --query registrationState -o tsv
+          az provider show --namespace Microsoft.ContainerRegistry --query registrationState -o tsv
+          az provider show --namespace Microsoft.Network --query registrationState -o tsv
+          az provider show --namespace Microsoft.ManagedIdentity --query registrationState -o tsv
+
+          az group create \
+            --name "${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            --location "${{ vars.TF_STATE_LOCATION }}"
+
+          az storage account create \
+            --name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --resource-group "${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            --location "${{ vars.TF_STATE_LOCATION }}" \
+            --sku Standard_LRS \
+            --kind StorageV2 \
+            --min-tls-version TLS1_2 \
+            --allow-blob-public-access false
+
+          az storage container create \
+            --name "${{ vars.TF_STATE_CONTAINER }}" \
+            --account-name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --auth-mode login
+
+  bootstrap-apply:
+    name: Bootstrap Apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'bootstrap-apply'
+    environment: azure-apply
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse bootstrap credentials
+        env:
+          BOOTSTRAP_CREDENTIALS: ${{ secrets.BOOTSTRAP_CREDENTIALS }}
+        run: |
+          CLIENT_ID="$(jq -r '.azure_client_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          CLIENT_SECRET="$(jq -r '.azure_client_secret' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          TENANT_ID="$(jq -r '.azure_tenant_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          SUBSCRIPTION_ID="$(jq -r '.azure_subscription_id' <<< "${BOOTSTRAP_CREDENTIALS}")"
+          GITHUB_ADMIN_TOKEN="$(jq -r '.github_token' <<< "${BOOTSTRAP_CREDENTIALS}")"
+
+          for value in "${CLIENT_ID}" "${CLIENT_SECRET}" "${TENANT_ID}" "${SUBSCRIPTION_ID}" "${GITHUB_ADMIN_TOKEN}"; do
+            echo "::add-mask::${value}"
+          done
+
+          {
+            echo "BOOTSTRAP_AZURE_CLIENT_ID=${CLIENT_ID}"
+            echo "BOOTSTRAP_AZURE_CLIENT_SECRET=${CLIENT_SECRET}"
+            echo "BOOTSTRAP_AZURE_TENANT_ID=${TENANT_ID}"
+            echo "BOOTSTRAP_AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}"
+            echo "BOOTSTRAP_GITHUB_TOKEN=${GITHUB_ADMIN_TOKEN}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Azure login
+        run: |
+          az login --service-principal \
+            --username "${BOOTSTRAP_AZURE_CLIENT_ID}" \
+            --password "${BOOTSTRAP_AZURE_CLIENT_SECRET}" \
+            --tenant "${BOOTSTRAP_AZURE_TENANT_ID}"
+          az account set --subscription "${BOOTSTRAP_AZURE_SUBSCRIPTION_ID}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve
+        env:
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_subscription_id: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ env.BOOTSTRAP_GITHUB_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ github.repository_owner }}
+          TF_VAR_github_app_repo: ${{ github.event.repository.name }}
+          TF_VAR_github_gitops_repo: ${{ github.event.repository.name }}
+          TF_VAR_github_gitops_repo_url: https://github.com/${{ github.repository }}.git
+
+      - name: Push generated GitHub secrets and variables
+        env:
+          GH_TOKEN: ${{ env.BOOTSTRAP_GITHUB_TOKEN }}
+          ARM_CLIENT_ID: ${{ env.BOOTSTRAP_AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ env.BOOTSTRAP_AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ env.BOOTSTRAP_AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.BOOTSTRAP_AZURE_SUBSCRIPTION_ID }}
+        run: |
+          GENERATED_CLIENT_ID="$(terraform output -raw github_actions_client_id)"
+          GENERATED_TENANT_ID="$(terraform output -raw github_actions_tenant_id)"
+          GENERATED_SUBSCRIPTION_ID="$(terraform output -raw github_actions_subscription_id)"
+          terraform output -json github_actions_repository_variables > /tmp/generated-vars.json
+
+          gh secret set AZURE_CLIENT_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_CLIENT_ID}"
+          gh secret set AZURE_TENANT_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_TENANT_ID}"
+          gh secret set AZURE_SUBSCRIPTION_ID --repo "${GITHUB_REPOSITORY}" --body "${GENERATED_SUBSCRIPTION_ID}"
+          gh secret set GITOPS_REPOSITORY_TOKEN --repo "${GITHUB_REPOSITORY}" --body "${BOOTSTRAP_GITHUB_TOKEN}"
+
+          for name in ACR_NAME ACR_LOGIN_SERVER GITOPS_REPOSITORY GH_OWNER GH_APP_REPO GH_GITOPS_REPO GH_GITOPS_REPO_URL; do
+            value="$(jq -r --arg name "${name}" '.[$name]' /tmp/generated-vars.json)"
+            gh variable set "${name}" --repo "${GITHUB_REPOSITORY}" --body "${value}"
+          done
+
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init without backend
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+    environment: azure-plan
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform plan
+        run: terraform plan -out=tfplan
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ vars.GH_OWNER }}
+          TF_VAR_github_app_repo: ${{ vars.GH_APP_REPO }}
+          TF_VAR_github_gitops_repo: ${{ vars.GH_GITOPS_REPO }}
+          TF_VAR_github_gitops_repo_url: ${{ vars.GH_GITOPS_REPO_URL }}
+
+      - name: Upload plan
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-azure-plan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  apply:
+    name: Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+    environment: azure-apply
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ vars.GH_OWNER }}
+          TF_VAR_github_app_repo: ${{ vars.GH_APP_REPO }}
+          TF_VAR_github_gitops_repo: ${{ vars.GH_GITOPS_REPO }}
+          TF_VAR_github_gitops_repo_url: ${{ vars.GH_GITOPS_REPO_URL }}
+
+  destroy-plan:
+    name: Destroy Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.action == 'destroy-plan' || github.event.inputs.action == 'destroy')
+    environment: azure-plan
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform destroy plan
+        run: terraform plan -destroy -out=tfdestroy
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ vars.GH_OWNER }}
+          TF_VAR_github_app_repo: ${{ vars.GH_APP_REPO }}
+          TF_VAR_github_gitops_repo: ${{ vars.GH_GITOPS_REPO }}
+          TF_VAR_github_gitops_repo_url: ${{ vars.GH_GITOPS_REPO_URL }}
+
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    needs: destroy-plan
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: azure-destroy
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}"
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform destroy
+        run: terraform destroy -auto-approve
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_github_gitops_token: ${{ secrets.GITOPS_REPOSITORY_TOKEN }}
+          TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+          TF_VAR_github_owner: ${{ vars.GH_OWNER }}
+          TF_VAR_github_app_repo: ${{ vars.GH_APP_REPO }}
+          TF_VAR_github_gitops_repo: ${{ vars.GH_GITOPS_REPO }}
+          TF_VAR_github_gitops_repo_url: ${{ vars.GH_GITOPS_REPO_URL }}

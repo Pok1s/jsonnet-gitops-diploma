@@ -1,0 +1,15 @@
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "11111111-1111-1111-1111-111111111111"
+location        = "westeurope"
+
+project     = "diploma-gitops"
+environment = "demo"
+
+github_owner          = "diploma-devops-lab"
+github_app_repo       = "diploma-demo-web"
+github_gitops_repo    = "diploma-gitops-repo"
+github_gitops_repo_url = "https://github.com/diploma-devops-lab/diploma-gitops-repo.git"
+
+acr_name = "pok1sdiplomaacr"
+
+admin_cidr_blocks = ["0.0.0.0/0"]

@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: app-generator-prod
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - list:
+        elements:
+          - envs_file: prod
+  template:
+    metadata:
+      name: app-generator-{{.envs_file}}
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/diploma-devops-lab/diploma-gitops-repo.git
+        targetRevision: main
+        path: gitops-repo/app-generator
+        directory:
+          include: app-generator-list.jsonnet
+          jsonnet:
+            extVars:
+              - name: env
+                value: ''
+              - name: envs_file
+                value: '{{.envs_file}}'
+              - name: repo_url
+                value: https://github.com/diploma-devops-lab/diploma-gitops-repo.git
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: argocd
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

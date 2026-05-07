@@ -1,0 +1,14 @@
+config:
+  registries:
+    - name: Azure Container Registry
+      api_url: https://${acr_login_server}
+      prefix: ${acr_login_server}
+      credentials: pullsecret:argocd/regcred
+      default: true
+
+extraArgs:
+  - --interval
+  - 2m
+
+metrics:
+  enabled: true

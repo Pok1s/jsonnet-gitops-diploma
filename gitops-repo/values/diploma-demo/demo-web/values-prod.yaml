@@ -11,13 +11,13 @@ podLabels:
   component: demo-web
 image:
   repository: pok1sdiplomaacrauto.azurecr.io/diploma-demo-web
-  tag: prod-0e7c501-1
+  tag: prod-c4a93d5-1
 config:
   APP_NAME: diploma-demo-web
   APP_ENV: prod
-  APP_VERSION: prod-0e7c501-1
-  DEPLOYMENT_TIMESTAMP: '2026-05-07T00:06:06Z'
-  GIT_SHA: 0e7c5010d2814edc819c41e4baf11ae6cae85470
+  APP_VERSION: prod-c4a93d5-1
+  DEPLOYMENT_TIMESTAMP: '2026-05-07T00:59:03Z'
+  GIT_SHA: c4a93d5bda018e0e9124633c28ea2cd9c1177ff2
   PORT: '8080'
 secret:
   enabled: true
@@ -28,6 +28,8 @@ ingress:
   className: nginx
   host: diploma-demo.local
   hostlessRule: true
+  extraHosts:
+  - prod.9.163.160.100.sslip.io
 resources:
   requests:
     cpu: 100m

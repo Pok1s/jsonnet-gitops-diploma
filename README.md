@@ -1,4 +1,4 @@
-# Diploma GitOps CI/CD Demo
+# Diploma GitOps CI/CD Demo 
 
 Production-style demo for CI/CD automation with GitHub Actions, Azure Container Registry, Argo CD, ApplicationSet, Jsonnet and Helm.
 

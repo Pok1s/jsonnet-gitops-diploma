@@ -1,52 +1,122 @@
-# Diploma GitOps CI/CD Demo 
+#GitOps CI/CD
 
-Production-style demo for CI/CD automation with GitHub Actions, Azure Container Registry, Argo CD, ApplicationSet, Jsonnet and Helm.
+Projekt kierunkowy pokazujący automatyzację wdrażania aplikacji Kubernetes z użyciem GitHub Actions, Azure, Terraform, Argo CD i Jsonnet.
 
-Structure:
+## Cel Projektu
 
-- `demo-app-repo` - test Node.js web app, Dockerfile and GitHub Actions pipeline.
-- `gitops-repo` - Argo CD ApplicationSet flow based on `argocd-workloads`, reduced to one demo application.
-- `terraform/azure` - Azure infrastructure: resource group, VNet, AKS, ACR, GitHub OIDC, Argo CD, Image Updater and NGINX Ingress.
-
-Main flow:
+Repozytorium prezentuje pełny proces GitOps:
 
 ```text
-push to GitHub
--> GitHub Actions tests, builds and pushes Docker image
--> workflow updates GitOps Helm values
--> Argo CD ApplicationSet runs Jsonnet app-generator
--> generated Application deploys Helm chart to Kubernetes
+commit w GitHub
+-> testy i build w GitHub Actions
+-> publikacja obrazu Docker w Azure Container Registry
+-> aktualizacja konfiguracji GitOps
+-> synchronizacja Argo CD
+-> wdrożenie aplikacji w AKS
 ```
 
-Infrastructure flow:
+## Struktura
 
 ```text
-GitHub Actions terraform workflow
--> Azure OIDC login
--> terraform plan/apply
--> AKS + ACR + Argo CD + Image Updater + NGINX Ingress
+demo-app-repo      aplikacja Node.js, testy, Dockerfile
+gitops-repo        Argo CD ApplicationSet, Jsonnet, Helm values
+terraform/azure    AKS, ACR, Argo CD, NGINX Ingress, GitHub OIDC
+.github/workflows  pipeline CI/CD i Terraform
 ```
 
-Only one manual GitHub secret is required for bootstrap:
+## Główne Workflow
+
+- `full-bootstrap-deploy.yml` - tworzy infrastrukturę, buduje obraz i wdraża aplikację.
+- `app-ci-cd.yml` - buduje nową wersję aplikacji i aktualizuje GitOps.
+- `terraform-azure.yml` - wykonuje `plan`, `apply` i `destroy` infrastruktury Azure.
+
+## Bootstrap
+
+Do pierwszego uruchomienia wymagany jest jeden sekret GitHub:
 
 ```text
 BOOTSTRAP_CREDENTIALS
 ```
 
-After `bootstrap-apply`, the workflow writes generated Azure/GitOps secrets and variables back to GitHub automatically.
+Format:
 
-Local checks:
+```json
+{
+  "azure_client_id": "...",
+  "azure_client_secret": "...",
+  "azure_tenant_id": "...",
+  "azure_subscription_id": "...",
+  "github_token": "..."
+}
+```
+
+Workflow sam wygeneruje i zapisze kolejne sekrety oraz zmienne repozytorium potrzebne do OIDC, ACR i GitOps.
+
+Przed uruchomieniem należy dodać zmienne:
+
+```text
+TF_STATE_RESOURCE_GROUP
+TF_STATE_LOCATION
+TF_STATE_STORAGE_ACCOUNT
+TF_STATE_CONTAINER
+TF_STATE_KEY
+ACR_NAME
+```
+
+## Uruchomienie
+
+1. Utworzyć repozytorium GitHub.
+2. Dodać `BOOTSTRAP_CREDENTIALS`.
+3. Dodać wymagane zmienne repozytorium.
+4. Wypchnąć kod do gałęzi `main`.
+5. Uruchomić workflow `Full Bootstrap And Deploy`.
+6. Sprawdzić w GitHub Actions linki do Argo CD i aplikacji.
+
+## Lokalne Sprawdzenie
 
 ```bash
 cd demo-app-repo
 npm install
+npm run lint
 npm test
+```
 
+```bash
 cd ../gitops-repo
-jsonnet --ext-str envs_file=dev --ext-str env='' app-generator/app-generator-list.jsonnet
-helm lint charts/service -f values/diploma-demo/common.yaml -f values/diploma-demo/demo-web/values-dev.yaml
+jsonnet --jpath app-generator \
+  --ext-str envs_file=dev \
+  --ext-str env='' \
+  --ext-str repo_url='https://github.com/Pok1s/jsonnet-gitops-diploma.git' \
+  app-generator/app-generator-list.jsonnet
+```
 
+```bash
 cd ../terraform/azure
-terraform init
+terraform init -backend=false
 terraform validate
 ```
+
+## Zasoby Kubernetes
+
+Projekt wdraża:
+
+- Namespace
+- Deployment
+- Service
+- Ingress
+- ConfigMap
+- Secret
+- HorizontalPodAutoscaler
+
+Środowiska: `dev`, `stage`, `prod`.
+
+## Scenariusz Demo
+
+1. Pokazać repozytorium i strukturę projektu.
+2. Uruchomić GitHub Actions pipeline.
+3. Pokazać obraz w Azure Container Registry.
+4. Pokazać commit z aktualizacją GitOps.
+5. Pokazać aplikację Argo CD jako `Synced` i `Healthy`.
+6. Pokazać zasoby Kubernetes.
+7. Otworzyć aplikację w przeglądarce.
+
